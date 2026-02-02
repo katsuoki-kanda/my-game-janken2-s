@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>Janken Game Online - Audio Fixed</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+
+    <style>
+        body { 
+            font-family: sans-serif; 
+            display: flex; 
+            flex-direction: column; 
+            align-items: center; 
+            justify-content: center;
+            background: #f0f0f0; 
+            margin: 0; 
+            height: 100vh;
+            width: 100vw;
+            overflow: hidden; 
+        }
+        
+        #wrapper {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            width: 100%;
+            height: 100%;
+        }
+
+        #game-container { 
+            display: flex; 
+            gap: 10px; 
+            padding: 5px;
+            /* 画面サイズに合わせて自動拡大・縮小 */
+            transform: scale(min(1.1, 98vw / 1300px));
+            transform-origin: center center;
+        }
+
+        .window { 
+            background: #000; 
+            border: 4px solid #333; 
+            position: relative; 
+            width: 640px; 
+            height: 480px; 
+            flex-shrink: 0;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+
+        video, canvas { 
+            position: absolute; 
+            width: 100%; 
+            height: 100%; 
+            transform: scaleX(-1); 
+        }
+        
+        #ui-overlay { 
+            position: absolute; 
+            top: 10px; 
+            right: 15px; 
+            color: #0f0; 
+            font-size: 42px; 
+            text-shadow: 2px 2px #000; 
+            z-index: 10; 
+            pointer-events: none; 
+            text-align: right;
+        }
+        
+        #prompt-window { background: white; display: flex; justify-content: center; align-items: center; }
+        #prompt-img { max-width: 100%; max-height: 100%; object-fit: contain; }
+        
+        #center-msg { 
+            position: absolute; 
+            top: 50%; 
+            left: 50%; 
+            transform: translate(-50%, -50%); 
+            color: #ff00ff; 
+            font-size: 72px; 
+            font-weight: bold; 
+            text-align: center; 
+            z-index: 20; 
+            width: 100%;
+            pointer-events: none;
+            text-shadow: 3px 3px 5px rgba(0,0,0,0.5);
+            line-height: 1.2;
+        }
+
+        /* スタート画面のオーバーレイ（最初の1回のみ表示） */
+        #start-overlay {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.85);
+            display: flex; flex-direction: column; justify-content: center; align-items: center;
+            z-index: 200; pointer-events: auto; cursor: pointer;
+        }
+        .start-btn { font-size: 40px; padding: 20px 50px; background: #0f0; color: #000; border-radius: 50px; font-weight: bold; }
+        #start-overlay p { font-size: 20px; margin-top: 20px; color: white; }
+    </style>
+</head>
+<body>
+
+<div id="wrapper">
+    <div id="start-overlay" onclick="handleStartInteraction()">
+        <div class="start-btn">GAME START</div>
+        <p>画面をタップして音声を有効にしてください</p>
+    </div>
+
+    <div id="game-container">
+        <div class="window">
+            <video id="input_video" playsinline></video>
+            <canvas id="output_canvas"></canvas>
+            <div id="ui-overlay">
+                <div id="score-display">Score: 0</div>
+                <div id="timer-display" style="color: #f00;">Time: 60</div>
+                <div id="status-display" style="color: #0ff;">---</div>
+            </div>
+        </div>
+
+        <div class="window" id="prompt-window">
+            <img id="prompt-img" src="0.jpg" alt="Instruction">
+            <div id="center-msg">HAND UP TO START</div>
+        </div>
+    </div>
+</div>
+
+<script>
+    const videoElement = document.getElementById('input_video');
+    const canvasElement = document.getElementById('output_canvas');
+    const canvasCtx = canvasElement.getContext('2d');
+    const promptImg = document.getElementById('prompt-img');
+    const scoreText = document.getElementById('score-display');
+    const timerText = document.getElementById('timer-display');
+    const statusText = document.getElementById('status-display');
+    const centerMsg = document.getElementById('center-msg');
+    const startOverlay = document.getElementById('start-overlay');
+
+    let score = 0;
+    let timeLeft = 60;
+    let gameStarted = false;
+    let currentTask = 0; 
+    let previousTaskType = -1; 
+    let lastHandState = -1; 
+    let gameTimer = null;
+    let isProcessingCorrect = false;
+    let isStartingWait = false; 
+    let isPostGameDelay = false; 
+    let audioUnlocked = false;
+
+    // 音声管理用の共通コンテキスト
+    let audioCtx = null;
+    const synth = window.speechSynthesis;
+
+    // Chromebook/iOS用：音声合成のウォームアップ
+    function primeSpeech() {
+        synth.cancel();
+        const ut = new SpeechSynthesisUtterance("");
+        synth.speak(ut);
+    }
+
+    function speak(text) {
+        if (!audioUnlocked) return;
+        if (synth.speaking) synth.cancel();
+        const uttr = new SpeechSynthesisUtterance(text);
+        uttr.lang = 'ja-JP';
+        uttr.rate = 1.2;
+        synth.speak(uttr);
+    }
+
+    // 初回タップ時の処理
+    function handleStartInteraction() {
+        if (!audioCtx) {
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        if (audioCtx.state === 'suspended') {
+            audioCtx.resume();
+        }
+        audioUnlocked = true;
+        primeSpeech();
+        startOverlay.style.display = 'none'; // 以降、表示されません
+    }
+
+    function playSuccessSound() {
+        if (!audioCtx) return;
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+
+        const oscillator = audioCtx.createOscillator();
+        const gainNode = audioCtx.createGain();
+        oscillator.type = 'sine';
+        oscillator.frequency.setValueAtTime(880, audioCtx.currentTime); 
+        oscillator.frequency.exponentialRampToValueAtTime(1760, audioCtx.currentTime + 0.1); 
+        
+        gainNode.gain.setValueAtTime(0.1, audioCtx.currentTime);
+        gainNode.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.2);
+        
+        oscillator.connect(gainNode);
+        gainNode.connect(audioCtx.destination);
+        
+        oscillator.start();
+        oscillator.stop(audioCtx.currentTime + 0.2);
+    }
+
+    function getTaskType(taskNum) {
+        if (taskNum <= 3) return 1; // パー
+        if (taskNum >= 4 && taskNum <= 6) return 2; // チョキ
+        if (taskNum >= 7 && taskNum <= 9) return 3; // グー
+        return 0;
+    }
+
+    function checkAnswer(handType) {
+        if (!gameStarted || isProcessingCorrect || isStartingWait || isPostGameDelay) return false;
+        const currentTaskType = getTaskType(currentTask);
+        if (handType === currentTaskType) {
+            if (lastHandState !== handType) {
+                lastHandState = handType;
+                return true;
+            }
+        } else {
+            lastHandState = 0;
+        }
+        return false;
+    }
+
+    function nextQuestion() {
+        if (!gameStarted) return;
+        let nextTask;
+        let nextTaskType;
+        do {
+            nextTask = Math.floor(Math.random() * 9) + 1;
+            nextTaskType = getTaskType(nextTask);
+        } while (nextTaskType === previousTaskType);
+        currentTask = nextTask;
+        previousTaskType = nextTaskType;
+        promptImg.src = `${currentTask}.jpg`;
+    }
+
+    function onResults(results) {
+        canvasCtx.save();
+        canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+        
+        if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+            for (const landmarks of results.multiHandLandmarks) {
+                drawConnectors(canvasCtx, landmarks, HAND_CONNECTIONS, {color: '#00FF00', lineWidth: 2});
+                drawLandmarks(canvasCtx, landmarks, {color: '#FF0000', lineWidth: 1, radius: 2});
+                
+                const wristY = landmarks[0].y;
+                if (wristY > 0.85) {
+                    statusText.innerText = "判定範囲外";
+                    lastHandState = -1;
+                    continue;
+                }
+
+                const isIndexUp = landmarks[8].y < landmarks[6].y;
+                const isMiddleUp = landmarks[12].y < landmarks[10].y;
+                const isRingUp = landmarks[16].y < landmarks[14].y;
+                const isPinkyUp = landmarks[20].y < landmarks[18].y;
+
+                let handType = 0;
+                let currentHandLabel = "なし";
+
+                if (isIndexUp && isMiddleUp && isRingUp && isPinkyUp) {
+                    handType = 1; 
+                    currentHandLabel = "パー";
+                } else if (isIndexUp && isMiddleUp && !isRingUp && !isPinkyUp) {
+                    handType = 2; 
+                    currentHandLabel = "チョキ";
+                } else if (!isIndexUp && !isMiddleUp && !isRingUp && !isPinkyUp) {
+                    handType = 3; 
+                    currentHandLabel = "グー";
+                }
+
+                if (isStartingWait) {
+                    statusText.innerText = "手を下げてください";
+                    if (wristY > 0.5) isStartingWait = false;
+                    continue;
+                }
+
+                if (isPostGameDelay) {
+                    statusText.innerText = "待機中...";
+                    continue;
+                }
+
+                statusText.innerText = currentHandLabel;
+
+                if (gameStarted && !isProcessingCorrect) {
+                    if (handType !== 0 && checkAnswer(handType)) {
+                        isProcessingCorrect = true;
+                        score++;
+                        playSuccessSound();
+                        scoreText.innerText = `Score: ${score}`;
+                        centerMsg.innerText = "GOOD!";
+                        promptImg.src = "10.jpg";
+
+                        setTimeout(() => { 
+                            if (gameStarted) centerMsg.innerText = ""; 
+                            isProcessingCorrect = false;
+                            nextQuestion(); 
+                        }, 500);
+                    }
+                } else if (!gameStarted && wristY < 0.38 && !isPostGameDelay && audioUnlocked) {
+                    startGame();
+                }
+            }
+        } else {
+            lastHandState = -1;
+            statusText.innerText = "---";
+        }
+        canvasCtx.restore();
+    }
+
+    const hands = new Hands({
+        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+    hands.setOptions({
+        maxNumHands: 1,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5
+    });
+    hands.onResults(onResults);
+
+    const camera = new Camera(videoElement, {
+        onFrame: async () => {
+            await hands.send({image: videoElement});
+        },
+        width: 640,
+        height: 480
+    });
+
+    camera.start().catch(err => {
+        alert("カメラの起動に失敗しました。");
+        console.error(err);
+    });
+
+    function startGame() {
+        if (gameStarted || isPostGameDelay) return;
+        gameStarted = true;
+        isStartingWait = true; 
+        score = 0;
+        timeLeft = 60;
+        previousTaskType = -1; 
+        isProcessingCorrect = false;
+        scoreText.innerText = `Score: ${score}`;
+        timerText.innerText = `Time: ${timeLeft}`;
+        centerMsg.innerText = "";
+        
+        speak("スタート");
+        nextQuestion();
+
+        gameTimer = setInterval(() => {
+            timeLeft--;
+            timerText.innerText = `Time: ${timeLeft}`;
+            if (timeLeft <= 0) endGame();
+        }, 1000);
+    }
+
+    function endGame() {
+        gameStarted = false; 
+        clearInterval(gameTimer);
+        centerMsg.innerHTML = `FINISH!<br><span style='font-size:45px'>Score: ${score}</span>`;
+        speak(`${score}点です。終了。`);
+        promptImg.src = "0.jpg";
+        isPostGameDelay = true;
+        
+        // 3秒後に再開待ち状態にする（初回タップは済んでいるので、手を挙げるだけでOK）
+        setTimeout(() => {
+            isPostGameDelay = false;
+            centerMsg.innerText = "HAND UP TO START";
+            promptImg.src = "0.jpg";
+        }, 3000);
+    }
+</script>
+</body>
+</html>
